@@ -47,6 +47,17 @@ func loadModelFilter(path string) (map[string]struct{}, error) {
 	return filter, nil
 }
 
+func normalizeOllamaDoneReason(reason string) string {
+	switch reason {
+	case "", "stop", "end_turn", "eos":
+		return "stop"
+	case "length", "content_filter", "tool_calls":
+		return reason
+	default:
+		return "stop"
+	}
+}
+
 func main() {
 	r := gin.Default()
 	// Load the API key from environment variables.
@@ -519,13 +530,14 @@ func main() {
 			// Get finish reason, default to "stop" if not provided
 			finishReason := "stop"
 			if response.Choices[0].FinishReason != "" {
-				finishReason = string(response.Choices[0].FinishReason)
+				finishReason = normalizeOllamaDoneReason(string(response.Choices[0].FinishReason))
 			}
 
 			// Create Ollama-compatible response
 			ollamaResponse := map[string]interface{}{
 				"model":      fullModelName,
 				"created_at": time.Now().Format(time.RFC3339),
+				"response":   content,
 				"message": map[string]string{
 					"role":    "assistant",
 					"content": content,
@@ -617,13 +629,14 @@ func main() {
 
 			// Сохраняем причину остановки, если она есть в чанке
 			if len(response.Choices) > 0 && response.Choices[0].FinishReason != "" {
-				lastFinishReason = string(response.Choices[0].FinishReason)
+				lastFinishReason = normalizeOllamaDoneReason(string(response.Choices[0].FinishReason))
 			}
 
 			// Build JSON response structure for intermediate chunks (Ollama chat format)
 			responseJSON := map[string]interface{}{
 				"model":      fullModelName,
 				"created_at": time.Now().Format(time.RFC3339),
+				"response":   response.Choices[0].Delta.Content,
 				"message": map[string]string{
 					"role":    "assistant",
 					"content": response.Choices[0].Delta.Content, // Может быть ""
@@ -657,6 +670,7 @@ func main() {
 		finalResponse := map[string]interface{}{
 			"model":      fullModelName,
 			"created_at": time.Now().Format(time.RFC3339),
+			"response":   "",
 			"message": map[string]string{
 				"role":    "assistant",
 				"content": "", // Пустой контент для финального сообщения
