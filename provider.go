@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -41,6 +42,18 @@ func (o *OpenrouterProvider) Chat(messages []openai.ChatCompletionMessage, model
 	return resp, nil
 }
 
+func (o *OpenrouterProvider) ChatRequest(req openai.ChatCompletionRequest, modelName string) (openai.ChatCompletionResponse, error) {
+	req.Model = modelName
+	req.Stream = false
+
+	resp, err := o.client.CreateChatCompletion(context.Background(), req)
+	if err != nil {
+		return openai.ChatCompletionResponse{}, err
+	}
+
+	return resp, nil
+}
+
 func (o *OpenrouterProvider) ChatStream(messages []openai.ChatCompletionMessage, modelName string) (*openai.ChatCompletionStream, error) {
 	// Create a chat completion request
 	req := openai.ChatCompletionRequest{
@@ -56,6 +69,18 @@ func (o *OpenrouterProvider) ChatStream(messages []openai.ChatCompletionMessage,
 	}
 
 	// Return the stream for further processing
+	return stream, nil
+}
+
+func (o *OpenrouterProvider) ChatStreamRequest(req openai.ChatCompletionRequest, modelName string) (*openai.ChatCompletionStream, error) {
+	req.Model = modelName
+	req.Stream = true
+
+	stream, err := o.client.CreateChatCompletionStream(context.Background(), req)
+	if err != nil {
+		return nil, err
+	}
+
 	return stream, nil
 }
 
@@ -123,11 +148,21 @@ func (o *OpenrouterProvider) GetModels() ([]Model, error) {
 func (o *OpenrouterProvider) GetModelDetails(modelName string) (map[string]interface{}, error) {
 	// Stub response; replace with actual model details if available
 	currentTime := time.Now().Format(time.RFC3339)
+	capabilities := []string{"completion"}
+	if strings.ToLower(os.Getenv("VISION_ONLY")) == "true" {
+		capabilities = append(capabilities, "vision")
+	}
+
 	return map[string]interface{}{
+		"modelfile":  fmt.Sprintf("FROM %s", modelName),
 		"license":    "STUB License",
 		"system":     "STUB SYSTEM",
-		"modifiedAt": currentTime,
+		"template":   "{{ .Prompt }}",
+		"modified_at": currentTime,
 		"details": map[string]interface{}{
+			"parent_model":       "",
+			"family":             "openrouter",
+			"families":           []string{"openrouter"},
 			"format":             "gguf",
 			"parameter_size":     "200B",
 			"quantization_level": "Q4_K_M",
@@ -137,6 +172,7 @@ func (o *OpenrouterProvider) GetModelDetails(modelName string) (map[string]inter
 			"context_length":  200000,
 			"parameter_count": 200_000_000_000,
 		},
+		"capabilities": capabilities,
 	}, nil
 }
 

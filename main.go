@@ -447,9 +447,15 @@ func main() {
 
 	r.POST("/api/chat", func(c *gin.Context) {
 		var request struct {
-			Model    string                         `json:"model"`
-			Messages []openai.ChatCompletionMessage `json:"messages"`
-			Stream   *bool                          `json:"stream"` // Добавим поле Stream
+			Model    string `json:"model"`
+			Messages []struct {
+				Role    string   `json:"role"`
+				Content string   `json:"content"`
+				Images  []string `json:"images"`
+			} `json:"messages"`
+			Format  json.RawMessage `json:"format"`
+			Options map[string]any  `json:"options"`
+			Stream  *bool           `json:"stream"`
 		}
 
 		// Parse the JSON request
@@ -466,6 +472,8 @@ func main() {
 			streamRequested = *request.Stream
 		}
 
+		openAIRequest := buildOpenAIChatRequest(request.Model, request.Messages, request.Format, request.Options)
+
 		// Если стриминг не запрошен, нужно будет реализовать отдельную логику
 		// для сбора полного ответа и отправки его одним JSON.
 		// Пока реализуем только стриминг.
@@ -474,7 +482,7 @@ func main() {
 			var fullModelName string
 			var err error
 			if freeMode {
-				response, fullModelName, err = getFreeChatForModel(provider, request.Messages, request.Model)
+				response, fullModelName, err = getFreeChatRequestForModel(provider, openAIRequest, request.Model)
 				if err != nil {
 					slog.Error("free mode failed", "error", err)
 					c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -488,7 +496,7 @@ func main() {
 					c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 					return
 				}
-				response, err = provider.Chat(request.Messages, fullModelName)
+				response, err = provider.ChatRequest(openAIRequest, fullModelName)
 				if err != nil {
 					slog.Error("Failed to get chat response", "Error", err)
 					c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -523,7 +531,7 @@ func main() {
 					"content": content,
 				},
 				"done":              true,
-				"finish_reason":     finishReason,
+				"done_reason":       finishReason,
 				"total_duration":    response.Usage.TotalTokens * 10, // Approximate duration based on token count
 				"load_duration":     0,
 				"prompt_eval_count": response.Usage.PromptTokens,
@@ -542,7 +550,7 @@ func main() {
 		var fullModelName string
 		var err error
 		if freeMode {
-			stream, fullModelName, err = getFreeStreamForModel(provider, request.Messages, request.Model)
+			stream, fullModelName, err = getFreeStreamRequestForModel(provider, openAIRequest, request.Model)
 			if err != nil {
 				slog.Error("free mode failed", "error", err)
 				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -555,7 +563,7 @@ func main() {
 				c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 				return
 			}
-			stream, err = provider.ChatStream(request.Messages, fullModelName)
+			stream, err = provider.ChatStreamRequest(openAIRequest, fullModelName)
 			if err != nil {
 				slog.Error("Failed to create stream", "Error", err)
 				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -654,7 +662,7 @@ func main() {
 				"content": "", // Пустой контент для финального сообщения
 			},
 			"done":              true,
-			"finish_reason":     lastFinishReason, // Необязательно для /api/chat Ollama, но не вредит
+			"done_reason":       lastFinishReason,
 			"total_duration":    0,
 			"load_duration":     0,
 			"prompt_eval_count": 0, // <--- ИЗМЕНЕНО: nil заменен на 0
@@ -1029,6 +1037,68 @@ func buildGenerateMessages(systemPrompt, prompt, suffix string) []openai.ChatCom
 	return messages
 }
 
+func buildOpenAIChatRequest(model string, messages []struct {
+	Role    string   `json:"role"`
+	Content string   `json:"content"`
+	Images  []string `json:"images"`
+}, format json.RawMessage, options map[string]any) openai.ChatCompletionRequest {
+	request := openai.ChatCompletionRequest{
+		Model:    model,
+		Messages: make([]openai.ChatCompletionMessage, 0, len(messages)),
+	}
+
+	for _, message := range messages {
+		converted := openai.ChatCompletionMessage{Role: message.Role}
+		if len(message.Images) == 0 {
+			converted.Content = message.Content
+		} else {
+			if message.Content != "" {
+				converted.MultiContent = append(converted.MultiContent, openai.ChatMessagePart{
+					Type: openai.ChatMessagePartTypeText,
+					Text: message.Content,
+				})
+			}
+			for _, image := range message.Images {
+				if image == "" {
+					continue
+				}
+				converted.MultiContent = append(converted.MultiContent, openai.ChatMessagePart{
+					Type: openai.ChatMessagePartTypeImageURL,
+					ImageURL: &openai.ChatMessageImageURL{
+						URL: "data:image/jpeg;base64," + image,
+					},
+				})
+			}
+		}
+		request.Messages = append(request.Messages, converted)
+	}
+
+	trimmedFormat := strings.TrimSpace(string(format))
+	if trimmedFormat != "" && trimmedFormat != "null" {
+		request.ResponseFormat = &openai.ChatCompletionResponseFormat{
+			Type: openai.ChatCompletionResponseFormatTypeJSONSchema,
+			JSONSchema: &openai.ChatCompletionResponseFormatJSONSchema{
+				Name:   "results",
+				Schema: format,
+				Strict: true,
+			},
+		}
+	}
+
+	if rawTemperature, ok := options["temperature"]; ok {
+		switch value := rawTemperature.(type) {
+		case float64:
+			request.Temperature = float32(value)
+		case float32:
+			request.Temperature = value
+		case int:
+			request.Temperature = float32(value)
+		}
+	}
+
+	return request
+}
+
 // resolveDisplayNameToFullModel resolves a display name back to the full model name
 func resolveDisplayNameToFullModel(displayName string) string {
 	for _, fullModel := range freeModels {
@@ -1068,6 +1138,52 @@ func getFreeChatForModel(provider *OpenrouterProvider, msgs []openai.ChatComplet
 	return getFreeChat(provider, msgs)
 }
 
+func getFreeChatRequestForModel(provider *OpenrouterProvider, req openai.ChatCompletionRequest, requestedModel string) (openai.ChatCompletionResponse, string, error) {
+	var resp openai.ChatCompletionResponse
+
+	fullModelName := resolveDisplayNameToFullModel(requestedModel)
+	if fullModelName != requestedModel || contains(freeModels, fullModelName) {
+		skip, err := failureStore.ShouldSkip(fullModelName)
+		if err == nil && !skip {
+			resp, err = provider.ChatRequest(req, fullModelName)
+			if err == nil {
+				_ = failureStore.ClearFailure(fullModelName)
+				return resp, fullModelName, nil
+			}
+			slog.Warn("requested model failed, trying fallback", "model", fullModelName, "error", err)
+			_ = failureStore.MarkFailure(fullModelName)
+		}
+	}
+
+	for _, m := range freeModels {
+		parts := strings.Split(m, "/")
+		displayName := parts[len(parts)-1]
+		if !isModelInFilter(displayName, modelFilter) {
+			continue
+		}
+
+		skip, err := failureStore.ShouldSkip(m)
+		if err != nil {
+			slog.Error("db error", "error", err)
+			continue
+		}
+		if skip {
+			continue
+		}
+
+		resp, err = provider.ChatRequest(req, m)
+		if err != nil {
+			slog.Warn("model failed", "model", m, "error", err)
+			_ = failureStore.MarkFailure(m)
+			continue
+		}
+		_ = failureStore.ClearFailure(m)
+		return resp, m, nil
+	}
+
+	return resp, "", fmt.Errorf("no free models available")
+}
+
 // getFreeStreamForModel tries to use a specific model first, then falls back to any available free model
 func getFreeStreamForModel(provider *OpenrouterProvider, msgs []openai.ChatCompletionMessage, requestedModel string) (*openai.ChatCompletionStream, string, error) {
 	// First try the requested model if it's in our free models list
@@ -1087,6 +1203,50 @@ func getFreeStreamForModel(provider *OpenrouterProvider, msgs []openai.ChatCompl
 
 	// Fallback to any available free model
 	return getFreeStream(provider, msgs)
+}
+
+func getFreeStreamRequestForModel(provider *OpenrouterProvider, req openai.ChatCompletionRequest, requestedModel string) (*openai.ChatCompletionStream, string, error) {
+	fullModelName := resolveDisplayNameToFullModel(requestedModel)
+	if fullModelName != requestedModel || contains(freeModels, fullModelName) {
+		skip, err := failureStore.ShouldSkip(fullModelName)
+		if err == nil && !skip {
+			stream, err := provider.ChatStreamRequest(req, fullModelName)
+			if err == nil {
+				_ = failureStore.ClearFailure(fullModelName)
+				return stream, fullModelName, nil
+			}
+			slog.Warn("requested model failed, trying fallback", "model", fullModelName, "error", err)
+			_ = failureStore.MarkFailure(fullModelName)
+		}
+	}
+
+	for _, m := range freeModels {
+		parts := strings.Split(m, "/")
+		displayName := parts[len(parts)-1]
+		if !isModelInFilter(displayName, modelFilter) {
+			continue
+		}
+
+		skip, err := failureStore.ShouldSkip(m)
+		if err != nil {
+			slog.Error("db error", "error", err)
+			continue
+		}
+		if skip {
+			continue
+		}
+
+		stream, err := provider.ChatStreamRequest(req, m)
+		if err != nil {
+			slog.Warn("model failed", "model", m, "error", err)
+			_ = failureStore.MarkFailure(m)
+			continue
+		}
+		_ = failureStore.ClearFailure(m)
+		return stream, m, nil
+	}
+
+	return nil, "", fmt.Errorf("no free models available")
 }
 
 // contains checks if a slice contains a string
