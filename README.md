@@ -9,6 +9,7 @@ This is heavily vibecoded and may not be production-ready. It is intended for pe
 - **Free Mode (Default)**: Automatically selects and uses free models from OpenRouter with intelligent fallback. Enabled by default unless `FREE_MODE=false` is set.
 - **Model Filtering**: Create a `models-filter/filter` file with model name patterns (one per line). Supports partial matching - `gemini` matches `gemini-2.0-flash-exp:free`. Works in both free and non-free modes.
 - **Tool Use Filtering**: Filter for only free models that support function calling/tool use by setting `TOOL_USE_ONLY=true`. Models are filtered based on their `supported_parameters` containing "tools" or "tool_choice".
+- **Vision Filtering**: Filter for only free models that accept image input by setting `VISION_ONLY=true`. In vision mode, the proxy also excludes models that charge for image input, so the remaining models stay free for image tagging and similar tasks.
 - **Ollama-like API**: The server listens on `11434` and exposes endpoints similar to Ollama (e.g., `/api/chat`, `/api/tags`).
 - **Model Listing**: Fetch a list of available models from OpenRouter.
 - **Model Details**: Retrieve metadata about a specific model.
@@ -40,13 +41,18 @@ The proxy operates in **free mode** by default, automatically selecting from ava
     export OPENAI_API_KEY="your-openrouter-api-key"
     ./ollama-proxy
 
+    # To only use free vision-capable models for image tagging
+    export VISION_ONLY=true
+    export OPENAI_API_KEY="your-openrouter-api-key"
+    ./ollama-proxy
+
 #### How Free Mode Works
 
 - **Automatic Model Discovery**: Fetches and caches available free models from OpenRouter
 - **Intelligent Fallback**: If a requested model fails, automatically tries other available free models
 - **Failure Tracking**: Temporarily skips models that have recently failed (15-minute cooldown)
 - **Model Prioritization**: Tries models in order of context length (largest first)
-- **Cache Management**: Maintains a `free-models` file for quick startup and a `failures.db` SQLite database for failure tracking
+- **Cache Management**: Maintains a filter-specific `free-models*` cache file for quick startup and a `failures.db` SQLite database for failure tracking
 
 Once running, the proxy listens on port `11434`. You can make requests to `http://localhost:11434` with your Ollama-compatible tooling.
 
@@ -135,6 +141,7 @@ curl -X POST http://localhost:11434/v1/chat/completions \
    OPENAI_API_KEY=your-openrouter-api-key
    FREE_MODE=true
    TOOL_USE_ONLY=false
+  VISION_ONLY=true
    ```
 
 
@@ -147,7 +154,10 @@ curl -X POST http://localhost:11434/v1/chat/completions \
 4. **Optional: Enable tool use filtering**:
    Set `TOOL_USE_ONLY=true` in your `.env` file to only use models that support function calling/tool use. This filters models based on their `supported_parameters` containing "tools" or "tool_choice".
 
-5. **Run with Docker Compose**:
+5. **Optional: Enable vision-only filtering**:
+  Set `VISION_ONLY=true` in your `.env` file to only expose free models that accept image input and do not charge for image uploads.
+
+6. **Run with Docker Compose**:
    ```bash
    docker compose up -d
    ```
@@ -162,6 +172,9 @@ docker run -p 11434:11434 -e OPENAI_API_KEY="your-openrouter-api-key" ollama-pro
 
 # To enable tool use filtering
 docker run -p 11434:11434 -e OPENAI_API_KEY="your-openrouter-api-key" -e TOOL_USE_ONLY=true ollama-proxy
+
+# To enable free vision-capable models for image tagging
+docker run -p 11434:11434 -e OPENAI_API_KEY="your-openrouter-api-key" -e VISION_ONLY=true ollama-proxy
 ```
 
 

@@ -21,6 +21,8 @@ var freeModels []string
 var failureStore *FailureStore
 var freeMode bool
 
+const freeModelsCacheBasePath = "free-models"
+
 func loadModelFilter(path string) (map[string]struct{}, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -58,7 +60,7 @@ func main() {
 
 	if freeMode {
 		var err error
-		freeModels, err = ensureFreeModelFile(apiKey, "free-models")
+		freeModels, err = ensureFreeModelFile(apiKey, freeModelCachePath(freeModelsCacheBasePath))
 		if err != nil {
 			slog.Error("failed to load free models", "error", err)
 			return
@@ -242,13 +244,20 @@ func main() {
 	})
 
 	r.POST("/api/show", func(c *gin.Context) {
-		var request map[string]string
-		if err := c.BindJSON(&request); err != nil {
+		var request struct {
+			Model   string `json:"model"`
+			Name    string `json:"name"`
+			Verbose bool   `json:"verbose"`
+		}
+		if err := c.ShouldBindJSON(&request); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON payload"})
 			return
 		}
 
-		modelName := request["name"]
+		modelName := request.Model
+		if modelName == "" {
+			modelName = request.Name
+		}
 		if modelName == "" {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Model name is required"})
 			return
@@ -261,6 +270,179 @@ func main() {
 		}
 
 		c.JSON(http.StatusOK, details)
+	})
+
+	r.POST("/api/generate", func(c *gin.Context) {
+		var request struct {
+			Model     string   `json:"model"`
+			Prompt    string   `json:"prompt"`
+			System    string   `json:"system"`
+			Suffix    string   `json:"suffix"`
+			Images    []string `json:"images"`
+			Stream    *bool    `json:"stream"`
+			KeepAlive any      `json:"keep_alive"`
+		}
+
+		if err := c.ShouldBindJSON(&request); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON payload"})
+			return
+		}
+
+		streamRequested := true
+		if request.Stream != nil {
+			streamRequested = *request.Stream
+		}
+
+		messages := buildGenerateMessages(request.System, request.Prompt, request.Suffix)
+
+		if !streamRequested {
+			var response openai.ChatCompletionResponse
+			var fullModelName string
+			var err error
+
+			if freeMode {
+				response, fullModelName, err = getFreeChatForModel(provider, messages, request.Model)
+				if err != nil {
+					slog.Error("free mode failed", "error", err)
+					c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+					return
+				}
+			} else {
+				fullModelName, err = provider.GetFullModelName(request.Model)
+				if err != nil {
+					slog.Error("Error getting full model name", "error", err)
+					c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+					return
+				}
+				response, err = provider.Chat(messages, fullModelName)
+				if err != nil {
+					slog.Error("Failed to get generate response", "error", err)
+					c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+					return
+				}
+			}
+
+			if len(response.Choices) == 0 {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "No response from model"})
+				return
+			}
+
+			content := response.Choices[0].Message.Content
+			doneReason := "stop"
+			if response.Choices[0].FinishReason != "" {
+				doneReason = string(response.Choices[0].FinishReason)
+			}
+
+			c.JSON(http.StatusOK, gin.H{
+				"model":                fullModelName,
+				"created_at":           time.Now().Format(time.RFC3339),
+				"response":             content,
+				"done":                 true,
+				"done_reason":          doneReason,
+				"context":              []int{},
+				"total_duration":       response.Usage.TotalTokens * 10,
+				"load_duration":        0,
+				"prompt_eval_count":    response.Usage.PromptTokens,
+				"prompt_eval_duration": 0,
+				"eval_count":           response.Usage.CompletionTokens,
+				"eval_duration":        response.Usage.CompletionTokens * 10,
+			})
+			return
+		}
+
+		var stream *openai.ChatCompletionStream
+		var fullModelName string
+		var err error
+
+		if freeMode {
+			stream, fullModelName, err = getFreeStreamForModel(provider, messages, request.Model)
+			if err != nil {
+				slog.Error("free mode failed", "error", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+		} else {
+			fullModelName, err = provider.GetFullModelName(request.Model)
+			if err != nil {
+				slog.Error("Error getting full model name", "error", err, "model", request.Model)
+				c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+				return
+			}
+			stream, err = provider.ChatStream(messages, fullModelName)
+			if err != nil {
+				slog.Error("Failed to create stream", "error", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+		}
+		defer stream.Close()
+
+		c.Writer.Header().Set("Content-Type", "application/x-ndjson")
+		c.Writer.Header().Set("Cache-Control", "no-cache")
+		c.Writer.Header().Set("Connection", "keep-alive")
+
+		w := c.Writer
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			slog.Error("Expected http.ResponseWriter to be an http.Flusher")
+			return
+		}
+
+		lastDoneReason := "stop"
+
+		for {
+			response, err := stream.Recv()
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				slog.Error("Backend stream error", "error", err)
+				errorJSON, _ := json.Marshal(gin.H{"error": "Stream error: " + err.Error()})
+				fmt.Fprintf(w, "%s\n", string(errorJSON))
+				flusher.Flush()
+				return
+			}
+
+			if len(response.Choices) > 0 && response.Choices[0].FinishReason != "" {
+				lastDoneReason = string(response.Choices[0].FinishReason)
+			}
+
+			chunkJSON, err := json.Marshal(gin.H{
+				"model":      fullModelName,
+				"created_at": time.Now().Format(time.RFC3339),
+				"response":   response.Choices[0].Delta.Content,
+				"done":       false,
+			})
+			if err != nil {
+				slog.Error("Error marshaling intermediate generate response", "error", err)
+				return
+			}
+
+			fmt.Fprintf(w, "%s\n", string(chunkJSON))
+			flusher.Flush()
+		}
+
+		finalJSON, err := json.Marshal(gin.H{
+			"model":                fullModelName,
+			"created_at":           time.Now().Format(time.RFC3339),
+			"response":             "",
+			"done":                 true,
+			"done_reason":          lastDoneReason,
+			"context":              []int{},
+			"total_duration":       0,
+			"load_duration":        0,
+			"prompt_eval_count":    0,
+			"prompt_eval_duration": 0,
+			"eval_count":           0,
+			"eval_duration":        0,
+		})
+		if err != nil {
+			slog.Error("Error marshaling final generate response", "error", err)
+			return
+		}
+
+		fmt.Fprintf(w, "%s\n", string(finalJSON))
+		flusher.Flush()
 	})
 
 	r.POST("/api/chat", func(c *gin.Context) {
@@ -823,6 +1005,28 @@ func getFreeStream(provider *OpenrouterProvider, msgs []openai.ChatCompletionMes
 		return stream, m, nil
 	}
 	return nil, "", fmt.Errorf("no free models available")
+}
+
+func buildGenerateMessages(systemPrompt, prompt, suffix string) []openai.ChatCompletionMessage {
+	messages := make([]openai.ChatCompletionMessage, 0, 2)
+	if systemPrompt != "" {
+		messages = append(messages, openai.ChatCompletionMessage{
+			Role:    openai.ChatMessageRoleSystem,
+			Content: systemPrompt,
+		})
+	}
+
+	userPrompt := prompt
+	if suffix != "" {
+		userPrompt += "\n" + suffix
+	}
+
+	messages = append(messages, openai.ChatCompletionMessage{
+		Role:    openai.ChatMessageRoleUser,
+		Content: userPrompt,
+	})
+
+	return messages
 }
 
 // resolveDisplayNameToFullModel resolves a display name back to the full model name

@@ -15,12 +15,16 @@ type orModels struct {
 		ID                   string   `json:"id"`
 		ContextLength        int      `json:"context_length"`
 		SupportedParameters  []string `json:"supported_parameters"`
+		Architecture         struct {
+			InputModalities []string `json:"input_modalities"`
+		} `json:"architecture"`
 		TopProvider          struct {
 			ContextLength int `json:"context_length"`
 		} `json:"top_provider"`
 		Pricing struct {
 			Prompt     string `json:"prompt"`
 			Completion string `json:"completion"`
+			Image      string `json:"image"`
 		} `json:"pricing"`
 	} `json:"data"`
 }
@@ -33,6 +37,33 @@ func supportsToolUse(supportedParams []string) bool {
 		}
 	}
 	return false
+}
+
+func supportsImageInput(inputModalities []string) bool {
+	for _, modality := range inputModalities {
+		if modality == "image" {
+			return true
+		}
+	}
+	return false
+}
+
+func isZeroPrice(price string) bool {
+	return price == "" || price == "0"
+}
+
+func freeModelCachePath(basePath string) string {
+	suffixes := []string{}
+	if strings.ToLower(os.Getenv("TOOL_USE_ONLY")) == "true" {
+		suffixes = append(suffixes, "tools")
+	}
+	if strings.ToLower(os.Getenv("VISION_ONLY")) == "true" {
+		suffixes = append(suffixes, "vision")
+	}
+	if len(suffixes) == 0 {
+		return basePath
+	}
+	return basePath + "." + strings.Join(suffixes, ".")
 }
 
 func fetchFreeModels(apiKey string) ([]string, error) {
@@ -56,6 +87,7 @@ func fetchFreeModels(apiKey string) ([]string, error) {
 	
 	// Check if tool use filtering is enabled
 	toolUseOnly := strings.ToLower(os.Getenv("TOOL_USE_ONLY")) == "true"
+	visionOnly := strings.ToLower(os.Getenv("VISION_ONLY")) == "true"
 	
 	type item struct {
 		id  string
@@ -63,10 +95,19 @@ func fetchFreeModels(apiKey string) ([]string, error) {
 	}
 	var items []item
 	for _, m := range result.Data {
-		if m.Pricing.Prompt == "0" && m.Pricing.Completion == "0" {
+		if isZeroPrice(m.Pricing.Prompt) && isZeroPrice(m.Pricing.Completion) {
 			// If tool use filtering is enabled, skip models that don't support tools
 			if toolUseOnly && !supportsToolUse(m.SupportedParameters) {
 				continue
+			}
+
+			if visionOnly {
+				if !supportsImageInput(m.Architecture.InputModalities) {
+					continue
+				}
+				if !isZeroPrice(m.Pricing.Image) {
+					continue
+				}
 			}
 			
 			ctx := m.TopProvider.ContextLength

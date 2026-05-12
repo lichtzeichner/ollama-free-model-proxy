@@ -9,6 +9,7 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - FREE_MODE=${FREE_MODE:-true}
       - TOOL_USE_ONLY=${TOOL_USE_ONLY:-false}
+      - VISION_ONLY=${VISION_ONLY:-true}
     volumes:
       - ./models-filter:/models-filter:ro
       - proxy-data:/data
